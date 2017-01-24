@@ -33,6 +33,10 @@ func newCounters() *counters {
 	}
 }
 
+func newCounters2() *counters2 {
+	return &counters2{}
+}
+
 type counters struct {
 	sync.RWMutex
 	counts map[string]*atomic.Uint64
@@ -63,6 +67,84 @@ func (c *counters) Reset(key string) {
 	count := c.counts[key]
 	c.Unlock()
 	count.Store(0)
+}
+
+// TODO: replace counters with counters2 once proven
+const (
+	// how many counters are under each lock; 8 uint64s fit in a 64-byte cache
+	// line.
+	_counters2PerLock    = 8
+	_counters2BucketMask = _counters2PerLock - 1
+
+	// target using 64KiB of memory
+	_counters2Width = 8192
+
+	// how many locks we need given those goals
+	_counters2Locks = _counters2Width / _counters2PerLock
+)
+
+type counters2 [_counters2Width]bucket2
+
+type bucket2 struct {
+	sync.Mutex
+	counts [_counters2PerLock]uint64
+}
+
+func (b *bucket2) inc(i uint32, key string) uint64 {
+	var n uint64
+	b.Lock()
+	n = b.counts[i]
+	n++
+	b.counts[i] = n
+	b.Unlock()
+	return n
+}
+
+func (b *bucket2) reset(i uint32, key string) {
+	b.Lock()
+	b.counts[i] = 0
+	b.Unlock()
+}
+
+func (c *counters2) Inc(key string) uint64 {
+	i := c.hash(key)
+	return c[i/_counters2PerLock].inc(i&_counters2BucketMask, key)
+}
+
+func (c *counters2) Reset(key string) {
+	i := c.hash(key)
+	c[i/_counters2PerLock].reset(i&_counters2BucketMask, key)
+}
+
+// hash hashes the key by first xor-collapsing it into a 64-bit state, and then
+// permuting that state with XSH RR (randomly rotated xorshift).
+//
+// TODO: engineer a custom member of the PCG permutation family that targets
+// our actual needed _counters2Width = 9-bit output space; this would avoid the
+// modulo.
+func (c *counters2) hash(key string) uint32 {
+	return xshrr(xorstring(key)) % _counters2Width
+}
+
+// xorstring converts a string into a uint64 by xoring together its
+// codepoints. It works by accumulating into a 64-bit "ring" which gets
+// rotated by the apparent "byte width" of each codepoint.
+func xorstring(s string) uint64 {
+	var n uint64
+	for i := 0; i < len(s); i++ {
+		n = ((n & 0xff) >> 56) | (n << 8)
+		n ^= uint64(s[i])
+	}
+	return n
+}
+
+// xshrr computes a "randomly" rotated xorshift; this is the "XSH RR"
+// transformation borrowed from the PCG famiily of random generators. It
+// returns a 32-bit output from a 64-bit state.
+func xshrr(n uint64) uint32 {
+	xorshifted := uint32(((n >> 18) ^ n) >> 27)
+	rot := uint32(n >> 59)
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
 }
 
 // Sample creates a facility that samples incoming entries.
